@@ -4,6 +4,7 @@ import numpy as np
 from scipy.stats import rankdata
 import requests
 import re
+from functools import lru_cache
 
 yf.set_tz_cache_location("~/.cache/yfinance")  # safer than None
 
@@ -13,9 +14,9 @@ VOL_WINDOW_DAYS = 252  # volatility measured over 1 year
 SECTOR_MAP = {
     "consumer cyclicals": ["Consumer Discretionary", "Consumer Cyclical", "Retail"],
     "banking/investment/finance": ["Financials", "Banks"],
-    "energy/resources": ["Energy", "Utilities: Energy"],
+    "energy/resources": ["Energy", "Utilities: Energy", "Utilities"],
     "industrial/manufacturing": ["Industrials"],
-    "technology/telecommunications/utilities": ["Information Technology", "Telecommunication Services", "Utilities"],
+    "technology/telecommunications/utilities": ["Information Technology", "Telecommunication Services", "Technology", "Artificial Intelligence"],
     "healthcare": ["Health Care", "Healthcare"]
 }
 
@@ -28,13 +29,20 @@ RISK_PROFILE_WEIGHTS = {
 def fetch_sp500_table():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0"}
-    html = requests.get(url, headers=headers).text
+    html = requests.get(url, headers=headers, timeout=15).text
     tables = pd.read_html(html)
     df = tables[0].copy()
     df.columns = [c.strip() for c in df.columns]
+    # find sector col robustly
     sector_col = next(c for c in df.columns if "Sector" in c)
     df = df.rename(columns={sector_col: "Sector"})
-    df['Symbol'] = df['Symbol'].str.replace('.', '-', regex=False)
+    # clean symbols like BRK.B
+    df['Symbol'] = (
+        df['Symbol']
+        .astype(str)
+        .str.replace(r'\s+\*.*$', '', regex=True)
+        .str.replace('.', '-', regex=False)
+    )
     return df[['Symbol', 'Security', 'Sector']]
 
 def filter_by_user_sector(sp500_df, user_sector_key):
@@ -44,49 +52,72 @@ def filter_by_user_sector(sp500_df, user_sector_key):
     mask = sp500_df['Sector'].apply(lambda s: any(a.lower() in s.lower() for a in allowed))
     return sp500_df[mask].reset_index(drop=True)
 
+from functools import lru_cache
+
+@lru_cache(maxsize=512)
+def _get_info_cached(t):
+    try:
+        return yf.Ticker(t).get_info()
+    except Exception:
+        return {}
+
 def fetch_tickers_data(tickers):
     tickers_str = " ".join(tickers)
-    prices = yf.download(tickers_str, period="1y", interval="1d", auto_adjust=True, threads=True)['Close']
+    prices = yf.download(
+        tickers_str,
+        period="1y",
+        interval="1d",
+        auto_adjust=True,
+        threads=True
+    )['Close']
     if isinstance(prices, pd.Series):
         prices = prices.to_frame(tickers[0])
     prices = prices.dropna(axis=1, how="all")  # drop failed downloads
 
     fundamentals = []
-    for t in prices.columns:  # only process tickers with price data
-        try:
-            tk = yf.Ticker(t)
-            info = tk.get_info()
-        except Exception:
-            info = {}
+    for t in prices.columns:
+        info = _get_info_cached(t)
         pe = info.get('trailingPE') or info.get('priceToEarningsTrailing12Months') or np.nan
         roe = info.get('returnOnEquity') or np.nan
-        profit_margin = info.get('profitMargins') or np.nan
-        fundamentals.append({'Symbol': t, 'PE': pe, 'ROE': roe, 'ProfitMargin': profit_margin})
+        pm = info.get('profitMargins') or info.get('operatingMargins') or info.get('grossMargins') or np.nan
+        fundamentals.append({'Symbol': t, 'PE': pe, 'ROE': roe, 'ProfitMargin': pm})
     info_df = pd.DataFrame(fundamentals).set_index('Symbol')
     return prices, info_df
+
 
 def compute_momentum(prices, lookback=MOM_WINDOW_DAYS):
     p = prices.dropna(how="all")
     if p.empty:
         return pd.Series(index=p.columns, data=np.nan)
 
-    # last available date and lookback target
     last_date = p.index[-1]
     target_date = last_date - pd.Timedelta(days=lookback)
-
-    # find closest available trading date
     if target_date not in p.index:
         target_date = p.index[p.index.get_indexer([target_date], method="nearest")[0]]
 
-    # now compute momentum
-    ret = (p.loc[last_date] / p.loc[target_date]) - 1
+    ret_long = (p.loc[last_date] / p.loc[target_date]) - 1
+    # blend with shorter-term (3 month) momentum for stability
+    short_window = 63
+    short_target = last_date - pd.Timedelta(days=short_window)
+    if short_target not in p.index:
+        short_target = p.index[p.index.get_indexer([short_target], method="nearest")[0]]
+    ret_short = (p.loc[last_date] / p.loc[short_target]) - 1
+
+    ret = 0.75 * ret_long + 0.25 * ret_short
+    # winsorize extreme outliers
+    cap = np.nanpercentile(ret, [5, 95])
+    ret = ret.clip(lower=cap[0], upper=cap[1])
     return ret
 
 def compute_volatility(prices, window=VOL_WINDOW_DAYS):
     daily_ret = prices.pct_change().dropna(how='all')
     if daily_ret.empty:
         return pd.Series(index=prices.columns, data=np.nan)
-    vol = daily_ret.std() * np.sqrt(252)
+    vol_std = daily_ret.std() * np.sqrt(252)
+    vol_ewma = daily_ret.ewm(span=63).std().iloc[-1] * np.sqrt(252)
+    vol = 0.5 * vol_std + 0.5 * vol_ewma
+    cap = np.nanpercentile(vol, [5, 95])
+    vol = vol.clip(lower=cap[0], upper=cap[1])
     return vol
 
 def normalize_series(s, higher_is_better=True):
@@ -111,9 +142,13 @@ def compute_quality_score(info_df):
     return 0.5 * roe_n + 0.5 * pm_n
 
 def compute_value_score(info_df):
-    pe = info_df['PE'].replace({0: np.nan})
+    pe = info_df['PE'].replace({0: np.nan, np.inf: np.nan, -np.inf: np.nan})
     inv_pe = 1 / pe
+    # winsorize extreme values
+    cap = np.nanpercentile(inv_pe, [5, 95])
+    inv_pe = inv_pe.clip(lower=cap[0], upper=cap[1])
     return normalize_series(inv_pe, higher_is_better=True)
+
 
 def compute_risk_penalty(vol_series):
     return normalize_series(vol_series, higher_is_better=True)
